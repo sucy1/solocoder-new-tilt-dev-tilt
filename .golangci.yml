@@ -1,0 +1,89 @@
+version: "2"
+run:
+  go: "1.26"
+  build-tags:
+    - integration
+  modules-download-mode: vendor
+  allow-parallel-runners: true
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - staticcheck
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - unconvert
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+    staticcheck:
+      checks:
+        - "SA1*"
+        - "SA2*" # concurrency issues
+        - "SA3*" # testing issues
+        - "SA4*" # no-op issues
+        - "SA5*" # correctness issues
+        - "SA6*" # performance issues
+        - "SA9*" # dubious constructs
+    govet:
+      disable:
+        - inline
+      settings:
+        printf:
+          funcs:
+            - Verbosef
+            - Infof
+            - Debugf
+            - PrintColorf
+    misspell:
+      locale: US
+      ignore-rules:
+        - servantes
+        - cancelled
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+        path: _test\.go
+      - linters:
+          - unconvert
+        path: types.go
+    paths:
+      - zz_generated.*\.go$
+      - vendored_openapi\.go$
+      - third_party$
+      - builtin$
+      - examples$
+      - web/node_modules
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/tilt-dev
+  exclusions:
+    generated: lax
+    paths:
+      - zz_generated.*\.go$
+      - vendored_openapi\.go$
+      - third_party$
+      - builtin$
+      - examples$
+      - web/node_modules

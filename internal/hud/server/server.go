@@ -1,0 +1,388 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
+	"net/url"
+	"os"
+	"time"
+
+	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	_ "github.com/gorilla/websocket"
+	jsoniter "github.com/json-iterator/go"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	tiltanalytics "github.com/tilt-dev/tilt/internal/analytics"
+	"github.com/tilt-dev/tilt/internal/hud/webview"
+	"github.com/tilt-dev/tilt/internal/store"
+	"github.com/tilt-dev/tilt/internal/store/tiltfiles"
+	"github.com/tilt-dev/tilt/pkg/assets"
+	"github.com/tilt-dev/tilt/pkg/model"
+	proto_webview "github.com/tilt-dev/tilt/pkg/webview"
+	"github.com/tilt-dev/wmclient/pkg/analytics"
+)
+
+const TiltTokenCookieName = "Tilt-Token"
+const TiltTokenHeaderName = "X-Tilt-Token"
+
+// CSRF token to protect the websocket. See:
+// https://dev.solita.fi/2018/11/07/securing-websocket-endpoints.html
+// https://christian-schneider.net/CrossSiteWebSocketHijacking.html
+var websocketCSRFToken = uuid.New()
+
+type analyticsPayload struct {
+	Verb string            `json:"verb"`
+	Name string            `json:"name"`
+	Tags map[string]string `json:"tags"`
+}
+
+type analyticsOptPayload struct {
+	Opt string `json:"opt"`
+}
+
+type triggerPayload struct {
+	ManifestNames []string          `json:"manifest_names"`
+	BuildReason   model.BuildReason `json:"build_reason"`
+}
+
+type overrideTriggerModePayload struct {
+	ManifestNames []string `json:"manifest_names"`
+	TriggerMode   int      `json:"trigger_mode"`
+}
+
+type HeadsUpServer struct {
+	ctx        context.Context
+	store      *store.Store
+	router     *mux.Router
+	a          *tiltanalytics.TiltAnalytics
+	wsList     *WebsocketList
+	ctrlClient ctrlclient.Client
+}
+
+func ProvideHeadsUpServer(
+	ctx context.Context,
+	store *store.Store,
+	assetServer assets.Server,
+	analytics *tiltanalytics.TiltAnalytics,
+	wsList *WebsocketList,
+	ctrlClient ctrlclient.Client) (*HeadsUpServer, error) {
+	r := mux.NewRouter().UseEncodedPath()
+	r.Use(originCheckMiddleware)
+	s := &HeadsUpServer{
+		ctx:        ctx,
+		store:      store,
+		router:     r,
+		a:          analytics,
+		wsList:     wsList,
+		ctrlClient: ctrlClient,
+	}
+
+	r.Handle("/api/view", s.requireToken(http.HandlerFunc(s.ViewJSON)))
+	r.Handle("/api/dump/engine", s.requireToken(http.HandlerFunc(s.DumpEngineJSON)))
+	r.Handle("/api/analytics", s.requireToken(http.HandlerFunc(s.HandleAnalytics)))
+	r.Handle("/api/analytics_opt", s.requireToken(http.HandlerFunc(s.HandleAnalyticsOpt)))
+	r.Handle("/api/trigger", s.requireToken(http.HandlerFunc(s.HandleTrigger)))
+	r.Handle("/api/override/trigger_mode", s.requireToken(http.HandlerFunc(s.HandleOverrideTriggerMode)))
+	r.Handle("/api/snapshot/{snapshot_id}", s.requireToken(http.HandlerFunc(s.SnapshotJSON)))
+	r.Handle("/api/websocket_token", s.requireToken(http.HandlerFunc(s.WebsocketToken)))
+	r.HandleFunc("/ws/view", s.ViewWebsocket)
+	r.Handle("/api/set_tiltfile_args", s.requireToken(http.HandlerFunc(s.HandleSetTiltfileArgs))).Methods("POST")
+
+	r.PathPrefix("/").Handler(s.cookieWrapper(assetServer))
+
+	return s, nil
+}
+
+type funcHandler struct {
+	f func(w http.ResponseWriter, r *http.Request)
+}
+
+func (fh funcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fh.f(w, r)
+}
+
+// originCheck returns true if the Origin header is missing/empty or host
+// matches the request host.
+func originCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host != r.Host {
+			return false
+		}
+	}
+	return true
+}
+
+// originCheckMiddleware rejects requests whose Origin header is present but does
+// not match the Host the client connected to. Browsers always include Origin on
+// cross-origin requests, so this blocks CSRF from network-reachable attackers
+// without affecting same-origin browser traffic or CLI tools (which omit Origin).
+func originCheckMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !originCheck(r) {
+			http.Error(w, "cross-origin request forbidden", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *HeadsUpServer) cookieWrapper(handler http.Handler) http.Handler {
+	return funcHandler{f: func(w http.ResponseWriter, r *http.Request) {
+		state := s.store.RLockState()
+		http.SetCookie(w, &http.Cookie{
+			Name:     TiltTokenCookieName,
+			Value:    string(state.Token),
+			Path:     "/",
+			SameSite: http.SameSiteStrictMode,
+		})
+		s.store.RUnlockState()
+		handler.ServeHTTP(w, r)
+	}}
+}
+
+// requireToken validates the Tilt-Token header or cookie against the current
+// session token. The middleware is bypassed when TILT_DISABLE_HUD_AUTH=1 is
+// set — intended for deployments that authenticate at a reverse-proxy or
+// load-balancer layer, NOT for general use. The env var is read per request
+// so it can be flipped at runtime (and so tests can use t.Setenv).
+func (s *HeadsUpServer) requireToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("TILT_DISABLE_HUD_AUTH") == "1" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		candidate := r.Header.Get(TiltTokenHeaderName)
+		if candidate == "" {
+			cookie, err := r.Cookie(TiltTokenCookieName)
+			if err != nil {
+				http.Error(w, "missing session token", http.StatusForbidden)
+				return
+			}
+			candidate = cookie.Value
+		}
+		state := s.store.RLockState()
+		valid := candidate == string(state.Token)
+		s.store.RUnlockState()
+		if !valid {
+			http.Error(w, "invalid session token", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *HeadsUpServer) Router() http.Handler {
+	return s.router
+}
+
+func (s *HeadsUpServer) ViewJSON(w http.ResponseWriter, req *http.Request) {
+	view, err := webview.CompleteView(req.Context(), s.ctrlClient, s.store)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error converting view to proto: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(view)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error rendering view payload: %v", err), http.StatusInternalServerError)
+	}
+}
+
+// Dump the JSON engine over http. Only intended for 'tilt dump engine'.
+func (s *HeadsUpServer) DumpEngineJSON(w http.ResponseWriter, req *http.Request) {
+	state := s.store.RLockState()
+	defer s.store.RUnlockState()
+
+	encoder := store.CreateEngineStateEncoder(w)
+	err := encoder.Encode(state)
+	if err != nil {
+		log.Printf("Error encoding: %v", err)
+	}
+}
+
+func (s *HeadsUpServer) SnapshotJSON(w http.ResponseWriter, req *http.Request) {
+	view, err := webview.CompleteView(req.Context(), s.ctrlClient, s.store)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error converting view to proto: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	snapshot := &proto_webview.Snapshot{
+		View:      view,
+		CreatedAt: metav1.NewMicroTime(time.Now()),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(snapshot)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error rendering view payload: %v", err), http.StatusInternalServerError)
+	}
+}
+
+func (s *HeadsUpServer) HandleAnalyticsOpt(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "must be POST request", http.StatusBadRequest)
+		return
+	}
+
+	var payload analyticsOptPayload
+
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&payload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	opt, err := analytics.ParseOpt(payload.Opt)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing opt '%s': %v", payload.Opt, err), http.StatusBadRequest)
+	}
+
+	// only logging on opt-in, because, well, opting out means the user just told us not to report data on them!
+	if opt == analytics.OptIn {
+		s.a.Incr("analytics.opt.in", nil)
+	}
+
+	s.store.Dispatch(store.AnalyticsUserOptAction{Opt: opt})
+}
+
+func (s *HeadsUpServer) HandleAnalytics(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "must be POST request", http.StatusBadRequest)
+		return
+	}
+
+	var payloads []analyticsPayload
+
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&payloads)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, p := range payloads {
+		if p.Verb != "incr" {
+			http.Error(w, "error parsing payloads: only incr verbs are supported", http.StatusBadRequest)
+			return
+		}
+
+		s.a.Incr(p.Name, p.Tags)
+	}
+}
+
+func (s *HeadsUpServer) HandleSetTiltfileArgs(w http.ResponseWriter, req *http.Request) {
+	var args []string
+	err := jsoniter.NewDecoder(req.Body).Decode(&args)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	ctx := req.Context()
+	err = tiltfiles.SetTiltfileArgs(ctx, s.ctrlClient, args)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error updating apiserver: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
+// Responds with:
+// * 200/empty body on success
+// * 200/error message in body on well-formed, unservicable requests (e.g. resource is disabled or doesn't exist)
+// * 400/error message in body on badly formed requests (e.g., invalid json)
+func (s *HeadsUpServer) HandleTrigger(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "must be POST request", http.StatusBadRequest)
+		return
+	}
+
+	var payload triggerPayload
+
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&payload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if len(payload.ManifestNames) != 1 {
+		http.Error(w, fmt.Sprintf("/api/trigger currently supports exactly one manifest name, got %d", len(payload.ManifestNames)), http.StatusBadRequest)
+		return
+	}
+
+	mn := model.ManifestName(payload.ManifestNames[0])
+
+	state := s.store.RLockState()
+	defer s.store.RUnlockState()
+	ms, ok := state.ManifestState(mn)
+	if !ok {
+		http.Error(w, fmt.Sprintf("resource %q does not exist", mn), http.StatusNotFound)
+	} else if ms != nil && ms.DisableState == v1alpha1.DisableStateDisabled {
+		_, _ = fmt.Fprintf(w, "resource %q is currently disabled", mn)
+	} else {
+		s.store.Dispatch(store.AppendToTriggerQueueAction{Name: mn, Reason: payload.BuildReason})
+	}
+}
+
+func (s *HeadsUpServer) HandleOverrideTriggerMode(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "must be POST request", http.StatusBadRequest)
+		return
+	}
+
+	var payload overrideTriggerModePayload
+
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&payload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	err = checkManifestsExist(s.store, payload.ManifestNames)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if !model.ValidTriggerMode(model.TriggerMode(payload.TriggerMode)) {
+		http.Error(w, fmt.Sprintf("invalid trigger mode: %d", payload.TriggerMode), http.StatusBadRequest)
+		return
+	}
+
+	s.store.Dispatch(OverrideTriggerModeAction{
+		ManifestNames: model.ManifestNames(payload.ManifestNames),
+		TriggerMode:   model.TriggerMode(payload.TriggerMode),
+	})
+}
+
+func (s *HeadsUpServer) WebsocketToken(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = w.Write([]byte(websocketCSRFToken.String()))
+}
+
+func checkManifestsExist(st store.RStore, mNames []string) error {
+	state := st.RLockState()
+	defer st.RUnlockState()
+	for _, mName := range mNames {
+		if _, ok := state.ManifestState(model.ManifestName(mName)); !ok {
+			return fmt.Errorf("no manifest found with name '%s'", mName)
+		}
+	}
+	return nil
+}
