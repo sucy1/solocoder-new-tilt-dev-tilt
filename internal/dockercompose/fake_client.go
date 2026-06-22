@@ -172,6 +172,10 @@ func (c *FakeDCClient) ContainerID(ctx context.Context, spec v1alpha1.DockerComp
 	return c.ContainerIDDefault, nil
 }
 
+func (c *FakeDCClient) ContainerStatus(ctx context.Context, spec v1alpha1.DockerComposeServiceSpec) (string, error) {
+	return "", nil
+}
+
 func (c *FakeDCClient) Version(_ context.Context) (string, string, error) {
 	if c.VersionOutput != "" {
 		return c.VersionOutput, "tilt-fake", nil

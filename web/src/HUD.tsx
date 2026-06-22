@@ -17,6 +17,7 @@ import { InterfaceVersion, useInterfaceVersion } from "./InterfaceVersion"
 import LogStore, { LogStoreProvider } from "./LogStore"
 import OverviewResourcePane from "./OverviewResourcePane"
 import OverviewTablePane from "./OverviewTablePane"
+import { ResourceDAG } from "./ResourceDAG"
 import PathBuilder, { PathBuilderProvider } from "./PathBuilder"
 import { ResourceGroupsContextProvider } from "./ResourceGroupsContext"
 import { ResourceListOptionsProvider } from "./ResourceListOptionsContext"
@@ -240,6 +241,14 @@ export default class HUD extends Component<HudProps, HudState> {
                               isSocketConnected={isSocketConnected}
                             />
                           </SidebarContextProvider>
+                        }
+                      />
+                      <Route
+                        path={this.path("/dag")}
+                        element={
+                          <div style={{ width: "100%", height: "100%" }}>
+                            <ResourceDAG resources={this.state.view.uiResources || []} />
+                          </div>
                         }
                       />
                       <Route

@@ -79,14 +79,14 @@ func (c *enableCmd) run(ctx context.Context, args []string) error {
 	a.Incr("cmd.enable", cmdTags.AsMap())
 	defer a.Flush(time.Second)
 
-	names := make(map[string]bool)
-	for _, name := range args {
-		names[name] = true
-	}
-
-	err = changeEnabledResources(ctx, ctrlclient, args, enableOptions{enable: true, all: c.all, only: c.only, labels: c.labels})
+	affected, err := changeEnabledResources(ctx, ctrlclient, args, enableOptions{enable: true, all: c.all, only: c.only, labels: c.labels})
 	if err != nil {
 		return err
+	}
+
+	err = persistDisableState(ctx, affected, false)
+	if err != nil {
+		return errors.Wrap(err, "persisting disable state")
 	}
 
 	return nil
@@ -107,11 +107,11 @@ func changeEnabledResources(
 	ctx context.Context,
 	cli client.Client,
 	selectedResources []string,
-	opts enableOptions) error {
+	opts enableOptions) ([]string, error) {
 	var uirs v1alpha1.UIResourceList
 	err := cli.List(ctx, &uirs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// before making any changes, validate that all selected names actually exist
@@ -123,13 +123,15 @@ func changeEnabledResources(
 	for _, name := range selectedResources {
 		uir, ok := uirByName[name]
 		if !ok {
-			return fmt.Errorf("no such resource %q", name)
+			return nil, fmt.Errorf("no such resource %q", name)
 		}
 		if len(uir.Status.DisableStatus.Sources) == 0 {
-			return fmt.Errorf("%s cannot be enabled or disabled", name)
+			return nil, fmt.Errorf("%s cannot be enabled or disabled", name)
 		}
 		selectedResourcesByName[name] = true
 	}
+
+	affectedResources := make([]string, 0)
 
 	for _, uir := range uirs.Items {
 		// resources w/o disable sources are always enabled (e.g., (Tiltfile))
@@ -159,9 +161,11 @@ func changeEnabledResources(
 			continue
 		}
 
+		affectedResources = append(affectedResources, uir.Name)
+
 		for _, source := range uir.Status.DisableStatus.Sources {
 			if source.ConfigMap == nil {
-				return fmt.Errorf("internal error: resource %s's DisableSource does not have a ConfigMap'", uir.Name)
+				return nil, fmt.Errorf("internal error: resource %s's DisableSource does not have a ConfigMap'", uir.Name)
 			}
 			cm := &v1alpha1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: source.ConfigMap.Name}}
 			_, err := controllerutil.CreateOrUpdate(ctx, cli, cm, func() error {
@@ -172,10 +176,10 @@ func changeEnabledResources(
 				return nil
 			})
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 
-	return nil
+	return affectedResources, nil
 }

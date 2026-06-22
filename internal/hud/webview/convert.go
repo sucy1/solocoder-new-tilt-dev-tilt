@@ -442,6 +442,14 @@ func populateResourceInfoView(mt *store.ManifestTarget, r *v1alpha1.UIResource) 
 		}
 		r.Status.K8sResourceInfo = rK8s
 	}
+
+	if len(mt.Manifest.ResourceDependencies) > 0 {
+		deps := make([]string, len(mt.Manifest.ResourceDependencies))
+		for i, dep := range mt.Manifest.ResourceDependencies {
+			deps[i] = dep.String()
+		}
+		r.Status.ResourceDependencies = deps
+	}
 }
 
 func LogSegmentToEvent(seg *proto_webview.LogSegment, spans map[string]*proto_webview.LogSpan) store.LogAction {

@@ -25,6 +25,8 @@ type downCmd struct {
 	fileName         string
 	deleteNamespaces bool
 	deleteVolumes    bool
+	wait             bool
+	waitTimeout      time.Duration
 	downDepsProvider func(ctx context.Context, tiltAnalytics *analytics.TiltAnalytics, subcommand model.TiltSubcommand) (DownDeps, error)
 }
 
@@ -67,6 +69,8 @@ See https://docs.tilt.dev/tiltfile_config.html for examples.
 	addNamespaceFlag(cmd)
 	cmd.Flags().BoolVar(&c.deleteNamespaces, "delete-namespaces", false, "delete namespaces defined in the Tiltfile (by default, don't)")
 	cmd.Flags().BoolVar(&c.deleteVolumes, "delete-volumes", false, "delete docker volumes defined in the Tiltfile (by default, don't)")
+	cmd.Flags().BoolVar(&c.wait, "wait", false, "wait for all resources to be fully stopped before returning")
+	cmd.Flags().DurationVar(&c.waitTimeout, "wait-timeout", 5*time.Minute, "timeout for waiting for resources to stop (default 5m)")
 
 	return cmd
 }
@@ -92,28 +96,45 @@ func (c *downCmd) down(ctx context.Context, downDeps DownDeps, args []string) er
 
 	sortedManifests := sortManifestsForDeletion(tlr.Manifests, tlr.EnabledManifests)
 
-	if err := deleteK8sEntities(ctx, sortedManifests, tlr.UpdateSettings, downDeps, c.deleteNamespaces); err != nil {
+	waitTimeout := time.Duration(0)
+	if c.wait {
+		waitTimeout = c.waitTimeout
+	}
+
+	if err := deleteK8sEntities(ctx, sortedManifests, tlr.UpdateSettings, downDeps, c.deleteNamespaces, waitTimeout); err != nil {
 		return err
 	}
 
 	dcProjects := make(map[string]v1alpha1.DockerComposeProject)
+	dcServices := make(map[string][]string)
 	for _, m := range sortedManifests {
 		if !m.IsDC() {
 			continue
 		}
 		proj := m.DockerComposeTarget().Spec.Project
+		svc := m.DockerComposeTarget().Spec.Service
 
 		if _, exists := dcProjects[proj.Name]; !exists {
 			dcProjects[proj.Name] = proj
 		}
+		dcServices[proj.Name] = append(dcServices[proj.Name], svc)
 	}
 
+	var errs []error
 	for _, dcProject := range dcProjects {
 		dcc := downDeps.dcClient
 		err = dcc.Down(ctx, dcProject, logger.Get(ctx).Writer(logger.InfoLvl), logger.Get(ctx).Writer(logger.InfoLvl), c.deleteVolumes)
 		if err != nil {
-			return errors.Wrap(err, "Running `docker-compose down`")
+			errs = append(errs, errors.Wrap(err, "Running `docker-compose down`"))
 		}
+	}
+
+	if len(errs) > 0 {
+		return utilerrors.NewAggregate(errs)
+	}
+
+	if c.wait {
+		return c.waitForResourcesStopped(ctx, downDeps, sortedManifests, dcProjects, dcServices)
 	}
 
 	return nil
@@ -178,7 +199,7 @@ func manifestsForNode(node *dependencyNode) []model.Manifest {
 	return append(manifests, node.manifest)
 }
 
-func deleteK8sEntities(ctx context.Context, manifests []model.Manifest, updateSettings model.UpdateSettings, downDeps DownDeps, deleteNamespaces bool) error {
+func deleteK8sEntities(ctx context.Context, manifests []model.Manifest, updateSettings model.UpdateSettings, downDeps DownDeps, deleteNamespaces bool, waitTimeout time.Duration) error {
 	kubeconfigWriter := downDeps.kubeconfigWriter
 	kClient := downDeps.kClient
 
@@ -232,8 +253,12 @@ func deleteK8sEntities(ctx context.Context, manifests []model.Manifest, updateSe
 
 	errs := []error{}
 	if len(entities) > 0 {
-		dCtx, cancel := context.WithTimeout(ctx, updateSettings.K8sUpsertTimeout())
-		err = downDeps.kClient.Delete(dCtx, entities, 0)
+		timeout := updateSettings.K8sUpsertTimeout()
+		if waitTimeout > 0 {
+			timeout = waitTimeout
+		}
+		dCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = downDeps.kClient.Delete(dCtx, entities, waitTimeout)
 		cancel()
 		if err != nil {
 			errs = append(errs, errors.Wrap(err, "Deleting k8s entities"))
@@ -241,7 +266,11 @@ func deleteK8sEntities(ctx context.Context, manifests []model.Manifest, updateSe
 	}
 
 	for _, deleteCmd := range deleteCmds {
-		dCtx, cancel := context.WithTimeout(ctx, updateSettings.K8sUpsertTimeout())
+		timeout := updateSettings.K8sUpsertTimeout()
+		if waitTimeout > 0 {
+			timeout = waitTimeout
+		}
+		dCtx, cancel := context.WithTimeout(ctx, timeout)
 		deleteCmd.Env = append(deleteCmd.Env, fmt.Sprintf("KUBECONFIG=%s", kubeconfigPath))
 		err := localexec.OneShotToLogger(dCtx, downDeps.execer, deleteCmd)
 		cancel()
@@ -278,4 +307,135 @@ func k8sToDelete(manifests ...model.Manifest) ([]k8s.K8sEntity, []model.Cmd, err
 		}
 	}
 	return allEntities, deleteCmds, nil
+}
+
+func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps, manifests []model.Manifest, dcProjects map[string]v1alpha1.DockerComposeProject, dcServices map[string][]string) error {
+	logger.Get(ctx).Infof("Waiting for all resources to stop (timeout: %s)...", c.waitTimeout)
+
+	ctx, cancel := context.WithTimeout(ctx, c.waitTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var unstoppedK8s []string
+	var unstoppedDC []string
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.forceTerminateResources(ctx, downDeps, manifests, dcProjects)
+
+			if len(unstoppedK8s) > 0 || len(unstoppedDC) > 0 {
+				logger.Get(ctx).Errorf("Timeout waiting for resources to stop. Force terminated. Unstopped resources:")
+				for _, name := range unstoppedK8s {
+					logger.Get(ctx).Errorf("  - k8s: %s", name)
+				}
+				for _, name := range unstoppedDC {
+					logger.Get(ctx).Errorf("  - docker-compose: %s", name)
+				}
+				return fmt.Errorf("timeout waiting for resources to stop after %s", c.waitTimeout)
+			}
+			return nil
+		case <-ticker.C:
+			unstoppedK8s = nil
+			unstoppedDC = nil
+
+			allStopped := true
+
+			for _, m := range manifests {
+				if m.IsK8s() {
+					stopped, err := c.checkK8sResourceStopped(ctx, downDeps, m)
+					if err != nil {
+						logger.Get(ctx).Verbosef("Error checking k8s resource %s: %v", m.Name, err)
+						allStopped = false
+						unstoppedK8s = append(unstoppedK8s, string(m.Name))
+					} else if !stopped {
+						allStopped = false
+						unstoppedK8s = append(unstoppedK8s, string(m.Name))
+					}
+				} else if m.IsDC() {
+					stopped, err := c.checkDCResourceStopped(ctx, downDeps, m)
+					if err != nil {
+						logger.Get(ctx).Verbosef("Error checking dc resource %s: %v", m.Name, err)
+						allStopped = false
+						unstoppedDC = append(unstoppedDC, string(m.Name))
+					} else if !stopped {
+						allStopped = false
+						unstoppedDC = append(unstoppedDC, string(m.Name))
+					}
+				}
+			}
+
+			if allStopped {
+				logger.Get(ctx).Infof("All resources stopped successfully.")
+				return nil
+			}
+
+			logger.Get(ctx).Infof("Waiting... %d k8s, %d dc resources still running", len(unstoppedK8s), len(unstoppedDC))
+		}
+	}
+}
+
+func (c *downCmd) checkK8sResourceStopped(ctx context.Context, downDeps DownDeps, m model.Manifest) (bool, error) {
+	kt := m.K8sTarget()
+	if kt.DeleteCmd != nil {
+		return true, nil
+	}
+
+	entities, err := k8s.ParseYAMLFromString(kt.YAML)
+	if err != nil {
+		return false, err
+	}
+
+	entities, _, err = k8s.Filter(entities, func(e k8s.K8sEntity) (b bool, err error) {
+		downPolicy, exists := e.Annotations()["tilt.dev/down-policy"]
+		return !exists || downPolicy != "keep", nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	for _, entity := range entities {
+		gvk := entity.GVK()
+		meta, err := downDeps.kClient.ListMeta(ctx, gvk, k8s.Namespace(entity.Namespace().String()))
+		if err != nil {
+			return false, err
+		}
+		for _, m := range meta {
+			if m.GetName() == entity.Name() {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func (c *downCmd) checkDCResourceStopped(ctx context.Context, downDeps DownDeps, m model.Manifest) (bool, error) {
+	dct := m.DockerComposeTarget()
+	spec := dct.Spec
+
+	status, err := downDeps.dcClient.ContainerStatus(ctx, spec)
+	if err != nil {
+		return false, err
+	}
+
+	if status == "" || status == "exited" || status == "dead" || status == "removing" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (c *downCmd) forceTerminateResources(ctx context.Context, downDeps DownDeps, manifests []model.Manifest, dcProjects map[string]v1alpha1.DockerComposeProject) {
+	logger.Get(ctx).Infof("Force terminating remaining resources...")
+
+	entities, _, err := k8sToDelete(manifests...)
+	if err == nil && len(entities) > 0 {
+		_ = downDeps.kClient.Delete(ctx, entities, 0)
+	}
+
+	for _, dcProject := range dcProjects {
+		dcc := downDeps.dcClient
+		_ = dcc.Down(ctx, dcProject, logger.Get(ctx).Writer(logger.InfoLvl), logger.Get(ctx).Writer(logger.InfoLvl), c.deleteVolumes)
+	}
 }

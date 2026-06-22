@@ -43,6 +43,9 @@ func (s State) RuntimeStatus() v1alpha1.RuntimeStatus {
 	if s.ContainerState.Error != "" || s.ContainerState.ExitCode != 0 {
 		return v1alpha1.RuntimeStatusError
 	}
+	if s.ContainerState.HealthStatus == "unhealthy" {
+		return v1alpha1.RuntimeStatusError
+	}
 	if s.ContainerState.Running ||
 		s.ContainerState.Status == ContainerStatusRunning ||
 		s.ContainerState.Status == ContainerStatusExited {
@@ -64,6 +67,9 @@ func (s State) RuntimeStatusError() error {
 	}
 	if s.ContainerState.ExitCode != 0 {
 		return fmt.Errorf("Container %s exited with %d", s.ContainerID, s.ContainerState.ExitCode)
+	}
+	if s.ContainerState.HealthStatus == "unhealthy" {
+		return fmt.Errorf("Container %s healthcheck failed: %s", s.ContainerID, s.ContainerState.HealthStatus)
 	}
 	return fmt.Errorf("Container %s error status: %s", s.ContainerID, s.ContainerState.Status)
 }

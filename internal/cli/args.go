@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +26,23 @@ import (
 	"github.com/tilt-dev/tilt/pkg/model"
 )
 
+const (
+	SourceDefault     = "default"
+	SourceConfigFile  = "config_file"
+	SourceEnvVar      = "env_var"
+	SourceCommandLine = "command_line"
+)
+
+type ArgInfo struct {
+	Name   string      `json:"name"`
+	Value  interface{} `json:"value"`
+	Source string      `json:"source"`
+}
+
 type argsCmd struct {
 	streams genericclioptions.IOStreams
 	clear   bool
+	json    bool
 }
 
 func newArgsCmd(streams genericclioptions.IOStreams) *argsCmd {
@@ -52,7 +69,9 @@ the editor defined by your TILT_EDITOR or EDITOR environment variables, or fall 
 an OS-appropriate default.
 
 Note that Tiltfile arguments do not affect built-in Tilt args (i.e., the things that show up in "tilt up --help", such as "--legacy", "--port"), and they
-are defined after built-in args, following a "--".`,
+are defined after built-in args, following a "--".
+
+Use --json to output all current effective parameters and their sources.`,
 		Example: `# Set new args
 tilt args frontend_service backend_service -- --debug on
 
@@ -60,11 +79,22 @@ tilt args frontend_service backend_service -- --debug on
 tilt args
 
 # Use an alternative editor
-EDITOR=nano tilt args`,
+EDITOR=nano tilt args
+
+# Output all current effective parameters and their sources in JSON format
+tilt args --json`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := preCommand(cmd.Context(), c.name())
+			if c.json {
+				return c.outputJSON(ctx)
+			}
+			return c.run(ctx, args)
+		},
 	}
 
 	addConnectServerFlags(cmd)
 	cmd.Flags().BoolVar(&c.clear, "clear", false, "Clear the Tiltfile args, as if you'd run tilt with no args")
+	cmd.Flags().BoolVar(&c.json, "json", false, "Output all current effective parameters and their sources in JSON format")
 
 	return cmd
 }
@@ -150,4 +180,158 @@ func (c *argsCmd) run(ctx context.Context, args []string) error {
 	logger.Get(ctx).Infof("Changed config args for Tilt running at %s to %v", apiHost(), args)
 
 	return nil
+}
+
+func (c *argsCmd) outputJSON(ctx context.Context) error {
+	_ = readEnvDefaults()
+
+	args := []ArgInfo{}
+
+	tiltPortEnv := os.Getenv("TILT_PORT")
+	tiltHostEnv := os.Getenv("TILT_HOST")
+	tiltKubeContextEnv := os.Getenv("TILT_KUBE_CONTEXT")
+	tiltNamespaceEnv := os.Getenv("TILT_NAMESPACE")
+	tiltLogLevelEnv := os.Getenv("TILT_LOG_LEVEL")
+	tiltLogSourceEnv := os.Getenv("TILT_LOG_SOURCE")
+
+	portSource := SourceDefault
+	if tiltPortEnv != "" {
+		portSource = SourceEnvVar
+	}
+	if webPortFlag != 0 && webPortFlag != defaultWebPort {
+		portSource = SourceCommandLine
+	}
+	portValue := defaultWebPort
+	if webPortFlag != 0 {
+		portValue = webPortFlag
+	}
+	args = append(args, ArgInfo{
+		Name:   "port",
+		Value:  portValue,
+		Source: portSource,
+	})
+
+	hostSource := SourceDefault
+	if tiltHostEnv != "" {
+		hostSource = SourceEnvVar
+	}
+	if webHostFlag != "" && webHostFlag != defaultWebHost {
+		hostSource = SourceCommandLine
+	}
+	hostValue := defaultWebHost
+	if webHostFlag != "" {
+		hostValue = webHostFlag
+	}
+	args = append(args, ArgInfo{
+		Name:   "host",
+		Value:  hostValue,
+		Source: hostSource,
+	})
+
+	kubeContextSource := SourceDefault
+	if tiltKubeContextEnv != "" {
+		kubeContextSource = SourceEnvVar
+	}
+	if kubeContextOverride != "" {
+		kubeContextSource = SourceCommandLine
+	}
+	args = append(args, ArgInfo{
+		Name:   "context",
+		Value:  kubeContextOverride,
+		Source: kubeContextSource,
+	})
+
+	namespaceSource := SourceDefault
+	if tiltNamespaceEnv != "" {
+		namespaceSource = SourceEnvVar
+	}
+	if namespaceOverride != "" {
+		namespaceSource = SourceCommandLine
+	}
+	args = append(args, ArgInfo{
+		Name:   "namespace",
+		Value:  namespaceOverride,
+		Source: namespaceSource,
+	})
+
+	logLevelSource := SourceDefault
+	if tiltLogLevelEnv != "" {
+		logLevelSource = SourceEnvVar
+	}
+	if logLevelFlag != "" && logLevelFlag != defaultLogLevel {
+		logLevelSource = SourceCommandLine
+	}
+	logLevelValue := defaultLogLevel
+	if logLevelFlag != "" {
+		logLevelValue = logLevelFlag
+	}
+	args = append(args, ArgInfo{
+		Name:   "log-level",
+		Value:  logLevelValue,
+		Source: logLevelSource,
+	})
+
+	logSourceSource := SourceDefault
+	if tiltLogSourceEnv != "" {
+		logSourceSource = SourceEnvVar
+	}
+	if logSourceFlag != "" && logSourceFlag != defaultLogSource {
+		logSourceSource = SourceCommandLine
+	}
+	logSourceValue := defaultLogSource
+	if logSourceFlag != "" {
+		logSourceValue = logSourceFlag
+	}
+	args = append(args, ArgInfo{
+		Name:   "log-source",
+		Value:  logSourceValue,
+		Source: logSourceSource,
+	})
+
+	args = append(args, ArgInfo{
+		Name:   "clear",
+		Value:  c.clear,
+		Source: boolSource(c.clear, false),
+	})
+
+	args = append(args, ArgInfo{
+		Name:   "json",
+		Value:  c.json,
+		Source: boolSource(c.json, false),
+	})
+
+	jsonOutput, err := json.MarshalIndent(args, "", "  ")
+	if err != nil {
+		return errors.Wrap(err, "error marshaling args to JSON")
+	}
+
+	fmt.Fprintln(c.streams.Out, string(jsonOutput))
+	return nil
+}
+
+func boolSource(current bool, defaultValue bool) string {
+	if current != defaultValue {
+		return SourceCommandLine
+	}
+	return SourceDefault
+}
+
+func intEnvOrDefault(envKey string, defaultValue int) (int, string) {
+	envVal := os.Getenv(envKey)
+	if envVal == "" {
+		return defaultValue, SourceDefault
+	}
+	val, err := strconv.Atoi(envVal)
+	if err != nil {
+		return defaultValue, SourceDefault
+	}
+	return val, SourceEnvVar
+}
+
+func stringEnvOrDefault(envKey string, defaultValue string) (string, string) {
+	envVal := os.Getenv(envKey)
+	if envVal == "" {
+		return defaultValue, SourceDefault
+	}
+	return envVal, SourceEnvVar
 }

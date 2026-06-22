@@ -45,6 +45,9 @@ export enum ResourceView {
 
   // The grid UI
   Grid,
+
+  // The DAG view showing resource dependencies
+  DAG,
 }
 
 export enum TriggerMode {

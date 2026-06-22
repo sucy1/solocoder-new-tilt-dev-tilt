@@ -47,6 +47,7 @@ type DockerComposeClient interface {
 	StreamEvents(ctx context.Context, spec v1alpha1.DockerComposeProject) (<-chan string, error)
 	Project(ctx context.Context, spec v1alpha1.DockerComposeProject) (*types.Project, error)
 	ContainerID(ctx context.Context, spec v1alpha1.DockerComposeServiceSpec) (container.ID, error)
+	ContainerStatus(ctx context.Context, spec v1alpha1.DockerComposeServiceSpec) (string, error)
 	Version(ctx context.Context) (canonicalVersion string, build string, err error)
 }
 
@@ -284,6 +285,14 @@ func (c *cmdDCClient) ContainerID(ctx context.Context, spec v1alpha1.DockerCompo
 	}
 
 	return container.ID(id), nil
+}
+
+func (c *cmdDCClient) ContainerStatus(ctx context.Context, spec v1alpha1.DockerComposeServiceSpec) (string, error) {
+	status, err := c.dcOutput(ctx, spec.Project, "ps", "-a", "--format", "{{.State}}", spec.Service)
+	if err != nil {
+		return "", err
+	}
+	return status, nil
 }
 
 // Version returns the parsed output of `docker compose version`, the canonical version and build (if present).
