@@ -72,7 +72,7 @@ See https://docs.tilt.dev/tiltfile_config.html for examples.
 	cmd.Flags().BoolVar(&c.deleteVolumes, "delete-volumes", false, "delete docker volumes defined in the Tiltfile (by default, don't)")
 	cmd.Flags().BoolVar(&c.wait, "wait", false, "wait for all resources to be fully stopped before returning")
 	cmd.Flags().DurationVar(&c.waitTimeout, "wait-timeout", 5*time.Minute, "timeout for waiting for resources to stop (default 5m)")
-	cmd.Flags().DurationVar(&c.waitInterval, "wait-interval", 2*time.Second, "initial polling interval for waiting, doubles with exponential backoff (default 2s)")
+	cmd.Flags().DurationVar(&c.waitInterval, "wait-interval", 5*time.Second, "initial polling interval for waiting, increases with adaptive backoff (default 5s)")
 
 	return cmd
 }
@@ -312,16 +312,18 @@ func k8sToDelete(manifests ...model.Manifest) ([]k8s.K8sEntity, []model.Cmd, err
 }
 
 func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps, manifests []model.Manifest, dcProjects map[string]v1alpha1.DockerComposeProject, dcServices map[string][]string) error {
-	const maxBackoff = 30 * time.Second
+	const maxBackoff = 1 * time.Minute
+	totalResources := len(manifests)
 	logger.Get(ctx).Infof("Waiting for all resources to stop (timeout: %s, initial interval: %s)...", c.waitTimeout, c.waitInterval)
 
 	ctx, cancel := context.WithTimeout(ctx, c.waitTimeout)
 	defer cancel()
 
-	interval := c.waitInterval
-	if interval <= 0 {
-		interval = 2 * time.Second
+	baseInterval := c.waitInterval
+	if baseInterval <= 0 {
+		baseInterval = 5 * time.Second
 	}
+	interval := baseInterval
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
@@ -379,11 +381,22 @@ func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps
 				return nil
 			}
 
+			unstoppedCount := len(unstoppedK8s) + len(unstoppedDC)
 			logger.Get(ctx).Infof("Waiting... %d k8s, %d dc resources still running (next check in %s)", len(unstoppedK8s), len(unstoppedDC), interval)
 
-			interval *= 2
+			ratio := float64(unstoppedCount) / float64(totalResources)
+			if ratio > 0.5 {
+				interval = time.Duration(float64(interval) * 1.2)
+			} else if ratio > 0.2 {
+				interval = time.Duration(float64(interval) * 1.5)
+			} else {
+				interval = time.Duration(float64(interval) * 2.0)
+			}
 			if interval > maxBackoff {
 				interval = maxBackoff
+			}
+			if interval < baseInterval {
+				interval = baseInterval
 			}
 			timer.Reset(interval)
 		}
