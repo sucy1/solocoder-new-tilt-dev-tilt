@@ -50,6 +50,23 @@ func (t DockerComposeTarget) DependencyIDs() []TargetID {
 	return result
 }
 
+func (t DockerComposeTarget) Dependencies() []string {
+	paths := make([]string, 0, len(t.Spec.Project.ConfigPaths))
+	for _, p := range t.Spec.Project.ConfigPaths {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	if t.Spec.Project.EnvFile != "" {
+		paths = append(paths, t.Spec.Project.EnvFile)
+	}
+	return sliceutils.DedupedAndSorted(paths)
+}
+
+func (t DockerComposeTarget) GetFileWatchIgnores() []v1alpha1.IgnoreDef {
+	return nil
+}
+
 func (t DockerComposeTarget) PublishedPorts() []int {
 	return append([]int{}, t.publishedPorts...)
 }

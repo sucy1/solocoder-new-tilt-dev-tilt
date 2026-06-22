@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState, useEffect } from "react"
+import React, { useMemo, useRef, useState, useEffect, useCallback } from "react"
 import styled from "styled-components"
 import { UIResource, ResourceStatus, UIResourceStatus } from "./types"
 
@@ -23,8 +23,20 @@ interface Edge {
   to: string
 }
 
+interface Bounds {
+  width: number
+  height: number
+}
+
 interface ResourceDAGProps {
   resources: UIResource[]
+}
+
+interface Viewport {
+  left: number
+  top: number
+  right: number
+  bottom: number
 }
 
 const NODE_WIDTH = 160
@@ -32,6 +44,7 @@ const NODE_HEIGHT = 60
 const NODE_H_SPACING = 80
 const NODE_V_SPACING = 40
 const PADDING = 50
+const VIEWPORT_MARGIN = 100
 
 const DAGContainer = styled.div`
   width: 100%;
@@ -248,6 +261,28 @@ const LegendColor = styled.div<{ $color: string }>`
   background: ${(props) => props.$color};
 `
 
+const NodeCountBadge = styled.div`
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  z-index: 100;
+`
+
+function isNodeInViewport(node: Node, viewport: Viewport): boolean {
+  return (
+    node.x + NODE_WIDTH >= viewport.left - VIEWPORT_MARGIN &&
+    node.x <= viewport.right + VIEWPORT_MARGIN &&
+    node.y + NODE_HEIGHT >= viewport.top - VIEWPORT_MARGIN &&
+    node.y <= viewport.bottom + VIEWPORT_MARGIN
+  )
+}
+
 export function ResourceDAG({ resources }: ResourceDAGProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 })
@@ -255,6 +290,8 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
   const [hoveredNode, setHoveredNode] = useState<Node | null>(null)
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 })
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 })
+  const [, forceUpdate] = useState(0)
 
   const { nodes, edges, bounds } = useMemo(() => {
     const resourceMap = new Map<string, UIResourceWithDeps>()
@@ -271,7 +308,7 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
       const deps = (r as UIResourceWithDeps).status?.resourceDependencies || []
       deps.forEach((dep) => {
         if (resourceMap.has(dep)) {
-          inDegree.set(name, (inDegree.get(name) || 0) + 1)
+          inDegree.set(name, (inDegree.get(name) || 0) + 1
           const depAdj = adjacency.get(dep) || []
           depAdj.push(name)
           adjacency.set(dep, depAdj)
@@ -319,10 +356,11 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
     let maxY = 0
     let maxX = 0
 
+    const maxLevelSize = Math.max(...levels.map((l) => l.length))
+
     levels.forEach((level, levelIndex) => {
-      const levelHeight =
-        level.length * (NODE_HEIGHT + NODE_V_SPACING) - NODE_V_SPACING
-      const startY = PADDING + (Math.max(...levels.map((l) => l.length)) * (NODE_HEIGHT + NODE_V_SPACING) - NODE_V_SPACING - levelHeight) / 2
+      const levelHeight = level.length * (NODE_HEIGHT + NODE_V_SPACING) - NODE_V_SPACING
+      const startY = PADDING + (maxLevelSize * (NODE_HEIGHT + NODE_V_SPACING) - NODE_V_SPACING - levelHeight) / 2
 
       level.forEach((nodeName, nodeIndex) => {
         const resource = resourceMap.get(nodeName)!
@@ -412,7 +450,134 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
     return map
   }, [nodesWithStatus])
 
+  const viewport = useMemo<Viewport>(() => {
+    const left = -transform.x / transform.scale
+    const top = -transform.y / transform.scale
+    const right = left + viewportSize.width / transform.scale
+    const bottom = top + viewportSize.height / transform.scale
+    return { left, top, right, bottom }
+  }, [transform, viewportSize])
+
+  const visibleNodeIds = useMemo(() => {
+    const set = new Set<string>()
+    nodesWithStatus.forEach((node) => {
+      if (isNodeInViewport(node, viewport)) {
+        set.add(node.id)
+      }
+    })
+    return set
+  }, [nodesWithStatus, viewport])
+
+  const visibleNodes = useMemo(() => {
+    return nodesWithStatus.filter((n) => visibleNodeIds.has(n.id))
+  }, [nodesWithStatus, visibleNodeIds])
+
+  const visibleEdges = useMemo(() => {
+    return edges.filter(
+      (e) => visibleNodeIds.has(e.from) || visibleNodeIds.has(e.to))
+  }, [edges, visibleNodeIds])
+
   useEffect(() => {
+    const updateSize = () => {
+      if (containerRef.current) {
+        setViewportSize({
+          width: containerRef.current.clientWidth,
+          height: containerRef.current.clientHeight,
+        })
+        forceUpdate((n) => n + 1)
+      }
+    }
+    updateSize()
+    window.addEventListener("resize", updateSize)
+    return () => window.removeEventListener("resize", updateSize)
+  }, [])
+
+  useEffect(() => {
+    if (containerRef.current) {
+      const containerWidth = containerRef.current.clientWidth
+      const containerHeight = containerRef.current.clientHeight
+      const scaleX = containerWidth / bounds.width
+      const scaleY = containerHeight / bounds.height
+      const initialScale = Math.min(scaleX, scaleY, 1) * 0.9
+      const centerX = (containerWidth - bounds.width * initialScale) / 2
+      const centerY = (containerHeight - bounds.height * initialScale) / 2
+      setTransform({ x: centerX, y: centerY, scale: initialScale })
+      setViewportSize({ width: containerWidth, height: containerHeight })
+    }
+  }, [bounds.width, bounds.height])
+
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault()
+    const delta = e.deltaY > 0 ? 0.9 : 1.1
+    setTransform((prev) => {
+      const newScale = Math.max(0.1, Math.min(3, prev.scale * delta))
+      const rect = containerRef.current?.getBoundingClientRect()
+      if (rect) {
+        const mouseX = e.clientX - rect.left
+        const mouseY = e.clientY - rect.top
+        const newX = mouseX - ((mouseX - prev.x) * newScale) / prev.scale
+        const newY = mouseY - ((mouseY - prev.y) * newScale) / prev.scale
+        return { x: newX, y: newY, scale: newScale }
+      }
+      return { ...prev, scale: newScale }
+    })
+  }, [])
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button === 0) {
+        setIsDragging(true)
+        setDragStart({ x: e.clientX - transform.x, y: e.clientY - transform.y })
+      }
+    },
+    [transform.x, transform.y]
+  )
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      const rect = containerRef.current?.getBoundingClientRect()
+      if (rect) {
+        setTooltipPos({
+          x: e.clientX - rect.left + 15,
+          y: e.clientY - rect.top + 15,
+        })
+      }
+
+      if (isDragging) {
+        setTransform((prev) => ({
+          ...prev,
+          x: e.clientX - dragStart.x,
+          y: e.clientY - dragStart.y,
+        }))
+      }
+    },
+    [isDragging, dragStart.x, dragStart.y]
+  )
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false)
+  }, [])
+
+  const handleMouseLeave = useCallback(() => {
+    setIsDragging(false)
+    setHoveredNode(null)
+  }, [])
+
+  const zoomIn = useCallback(() => {
+    setTransform((prev) => ({
+      ...prev,
+      scale: Math.min(3, prev.scale * 1.2),
+    }))
+  }, [])
+
+  const zoomOut = useCallback(() => {
+    setTransform((prev) => ({
+      ...prev,
+      scale: Math.max(0.1, prev.scale / 1.2),
+    }))
+  }, [])
+
+  const resetView = useCallback(() => {
     if (containerRef.current) {
       const containerWidth = containerRef.current.clientWidth
       const containerHeight = containerRef.current.clientHeight
@@ -425,85 +590,7 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
     }
   }, [bounds.width, bounds.height])
 
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    const delta = e.deltaY > 0 ? 0.9 : 1.1
-    const newScale = Math.max(0.1, Math.min(3, transform.scale * delta))
-
-    const rect = containerRef.current?.getBoundingClientRect()
-    if (rect) {
-      const mouseX = e.clientX - rect.left
-      const mouseY = e.clientY - rect.top
-
-      const newX = mouseX - ((mouseX - transform.x) * newScale) / transform.scale
-      const newY = mouseY - ((mouseY - transform.y) * newScale) / transform.scale
-
-      setTransform({ x: newX, y: newY, scale: newScale })
-    }
-  }
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 0) {
-      setIsDragging(true)
-      setDragStart({ x: e.clientX - transform.x, y: e.clientY - transform.y })
-    }
-  }
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    const rect = containerRef.current?.getBoundingClientRect()
-    if (rect) {
-      setTooltipPos({
-        x: e.clientX - rect.left + 15,
-        y: e.clientY - rect.top + 15,
-      })
-    }
-
-    if (isDragging) {
-      setTransform({
-        ...transform,
-        x: e.clientX - dragStart.x,
-        y: e.clientY - dragStart.y,
-      })
-    }
-  }
-
-  const handleMouseUp = () => {
-    setIsDragging(false)
-  }
-
-  const handleMouseLeave = () => {
-    setIsDragging(false)
-    setHoveredNode(null)
-  }
-
-  const zoomIn = () => {
-    setTransform((prev) => ({
-      ...prev,
-      scale: Math.min(3, prev.scale * 1.2),
-    }))
-  }
-
-  const zoomOut = () => {
-    setTransform((prev) => ({
-      ...prev,
-      scale: Math.max(0.1, prev.scale / 1.2),
-    }))
-  }
-
-  const resetView = () => {
-    if (containerRef.current) {
-      const containerWidth = containerRef.current.clientWidth
-      const containerHeight = containerRef.current.clientHeight
-      const scaleX = containerWidth / bounds.width
-      const scaleY = containerHeight / bounds.height
-      const initialScale = Math.min(scaleX, scaleY, 1) * 0.9
-      const centerX = (containerWidth - bounds.width * initialScale) / 2
-      const centerY = (containerHeight - bounds.height * initialScale) / 2
-      setTransform({ x: centerX, y: centerY, scale: initialScale })
-    }
-  }
-
-  const getEdgePath = (from: Node, to: Node) => {
+  const getEdgePath = useCallback((from: Node, to: Node) => {
     const fromX = from.x + NODE_WIDTH
     const fromY = from.y + NODE_HEIGHT / 2
     const toX = to.x
@@ -511,9 +598,9 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
     const midX = (fromX + toX) / 2
 
     return `M ${fromX} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${toX} ${toY}`
-  }
+  }, [])
 
-  const getStatusText = (status: ResourceStatus) => {
+  const getStatusText = useCallback((status: ResourceStatus) => {
     switch (status) {
       case ResourceStatus.Healthy:
         return "Healthy"
@@ -530,7 +617,7 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
       default:
         return "Unknown"
     }
-  }
+  }, [])
 
   return (
     <DAGContainer
@@ -555,23 +642,18 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
           </marker>
         </defs>
 
-        <g
-          transform={`translate(${transform.x}, ${transform.y}) scale(${transform.scale})`}
-        >
-          {edges.map((edge, i) => {
+        <g transform={`translate(${transform.x}, ${transform.y}) scale(${transform.scale})`}>
+          {visibleEdges.map((edge, i) => {
             const fromNode = nodeMap.get(edge.from)
             const toNode = nodeMap.get(edge.to)
             if (!fromNode || !toNode) return null
 
             return (
-              <EdgePath
-                key={`edge-${i}`}
-                d={getEdgePath(fromNode, toNode)}
-              />
+              <EdgePath key={`edge-${i}` d={getEdgePath(fromNode, toNode)} />
             )
           })}
 
-          {nodesWithStatus.map((node) => (
+          {visibleNodes.map((node) => (
             <NodeGroup
               key={node.id}
               $status={node.status}
@@ -587,7 +669,9 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
                 dominantBaseline="middle"
                 fontWeight="600"
               >
-                {node.id.length > 20 ? node.id.substring(0, 17) + "..." : node.id}
+                {node.id.length > 20
+                  ? node.id.substring(0, 17) + "..."
+                  : node.id}
               </text>
               <text
                 x={NODE_WIDTH / 2}
@@ -630,17 +714,13 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
           {hoveredNode.resource.status?.runtimeStatus && (
             <TooltipRow>
               <TooltipLabel>Runtime:</TooltipLabel>
-              <TooltipValue>
-                {hoveredNode.resource.status.runtimeStatus}
-              </TooltipValue>
+              <TooltipValue>{hoveredNode.resource.status.runtimeStatus}</TooltipValue>
             </TooltipRow>
           )}
           {hoveredNode.resource.status?.updateStatus && (
             <TooltipRow>
               <TooltipLabel>Update:</TooltipLabel>
-              <TooltipValue>
-                {hoveredNode.resource.status.updateStatus}
-              </TooltipValue>
+              <TooltipValue>{hoveredNode.resource.status.updateStatus}</TooltipValue>
             </TooltipRow>
           )}
           {hoveredNode.resource.status?.composeResourceInfo?.healthStatus && (
@@ -652,14 +732,13 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
             </TooltipRow>
           )}
           {(() => {
-            const deps = (hoveredNode.resource as UIResourceWithDeps).status?.resourceDependencies
+            const deps = (hoveredNode.resource as UIResourceWithDeps).status
+              ?.resourceDependencies
             if (deps && deps.length > 0) {
               return (
                 <TooltipRow>
                   <TooltipLabel>Dependencies:</TooltipLabel>
-                  <TooltipValue>
-                    {deps.join(", ")}
-                  </TooltipValue>
+                  <TooltipValue>{deps.join(", ")}</TooltipValue>
                 </TooltipRow>
               )
             }
@@ -695,6 +774,10 @@ export function ResourceDAG({ resources }: ResourceDAGProps) {
           <span>Disabled</span>
         </LegendItem>
       </Legend>
+
+      <NodeCountBadge>
+        Nodes: {visibleNodes.length} / {nodes.length} (Edges: {visibleEdges.length} / {edges.length})
+      </NodeCountBadge>
 
       <ZoomLevel>{Math.round(transform.scale * 100)}%</ZoomLevel>
 

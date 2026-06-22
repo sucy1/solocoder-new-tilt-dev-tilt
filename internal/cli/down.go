@@ -27,6 +27,7 @@ type downCmd struct {
 	deleteVolumes    bool
 	wait             bool
 	waitTimeout      time.Duration
+	waitInterval     time.Duration
 	downDepsProvider func(ctx context.Context, tiltAnalytics *analytics.TiltAnalytics, subcommand model.TiltSubcommand) (DownDeps, error)
 }
 
@@ -71,6 +72,7 @@ See https://docs.tilt.dev/tiltfile_config.html for examples.
 	cmd.Flags().BoolVar(&c.deleteVolumes, "delete-volumes", false, "delete docker volumes defined in the Tiltfile (by default, don't)")
 	cmd.Flags().BoolVar(&c.wait, "wait", false, "wait for all resources to be fully stopped before returning")
 	cmd.Flags().DurationVar(&c.waitTimeout, "wait-timeout", 5*time.Minute, "timeout for waiting for resources to stop (default 5m)")
+	cmd.Flags().DurationVar(&c.waitInterval, "wait-interval", 2*time.Second, "initial polling interval for waiting, doubles with exponential backoff (default 2s)")
 
 	return cmd
 }
@@ -310,13 +312,18 @@ func k8sToDelete(manifests ...model.Manifest) ([]k8s.K8sEntity, []model.Cmd, err
 }
 
 func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps, manifests []model.Manifest, dcProjects map[string]v1alpha1.DockerComposeProject, dcServices map[string][]string) error {
-	logger.Get(ctx).Infof("Waiting for all resources to stop (timeout: %s)...", c.waitTimeout)
+	const maxBackoff = 30 * time.Second
+	logger.Get(ctx).Infof("Waiting for all resources to stop (timeout: %s, initial interval: %s)...", c.waitTimeout, c.waitInterval)
 
 	ctx, cancel := context.WithTimeout(ctx, c.waitTimeout)
 	defer cancel()
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	interval := c.waitInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	var unstoppedK8s []string
 	var unstoppedDC []string
@@ -337,7 +344,7 @@ func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps
 				return fmt.Errorf("timeout waiting for resources to stop after %s", c.waitTimeout)
 			}
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
 			unstoppedK8s = nil
 			unstoppedDC = nil
 
@@ -372,7 +379,13 @@ func (c *downCmd) waitForResourcesStopped(ctx context.Context, downDeps DownDeps
 				return nil
 			}
 
-			logger.Get(ctx).Infof("Waiting... %d k8s, %d dc resources still running", len(unstoppedK8s), len(unstoppedDC))
+			logger.Get(ctx).Infof("Waiting... %d k8s, %d dc resources still running (next check in %s)", len(unstoppedK8s), len(unstoppedDC), interval)
+
+			interval *= 2
+			if interval > maxBackoff {
+				interval = maxBackoff
+			}
+			timer.Reset(interval)
 		}
 	}
 }
